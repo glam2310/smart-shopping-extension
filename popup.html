@@ -1,17 +1,19 @@
 <!DOCTYPE html>
 <html lang="he" dir="rtl">
+
 <head>
     <meta charset="UTF-8">
     <title>Smart Shopping Extension</title>
     <link rel="stylesheet" href="styles.css">
 </head>
+
 <body>
 
     <div class="main-header">Smart Shopping Extension</div>
 
     <div class="card">
         <div class="section-title">Price Comparison</div>
-        
+
         <div class="product-info">
             <div class="info-item">
                 <span class="info-label">Product:</span>
@@ -21,13 +23,20 @@
                 <span class="info-label">Brand:</span>
                 <span id="brandName" class="info-value">Scanning...</span>
             </div>
+            <div class="info-item">
+                <span class="info-label">SKU:</span>
+                <span id="skuValue" class="info-value">-</span>
+            </div>
+        </div>
+
+        <div id="dynamicButtonsContainer" class="btn-container">
+            <div class="loading-text">Checking availability across sites...</div>
         </div>
 
         <div class="btn-container">
-            <button id="searchBtn" class="btn-primary">Check Terminal X Price</button>
             <button id="createAlertBtn" class="btn-outline">Create Product Alert</button>
         </div>
-        
+
         <div id="resultsList"></div>
         <div id="alertStatus"></div>
     </div>
@@ -43,8 +52,11 @@
         <div>Host: <span id="debugHostname">-</span></div>
         <div>Brand: <span id="debugBrand">-</span></div>
         <div>Product: <span id="debugProduct">-</span></div>
+        <div>SKU: <span id="debugSku">-</span></div>
     </div>
 
+    <script src="config.js"></script>
     <script src="popup.js"></script>
 </body>
+
 </html>

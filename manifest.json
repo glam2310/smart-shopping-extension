@@ -18,20 +18,14 @@
   "background": {
     "service_worker": "background.js"
   },
- "content_scripts": [
+"content_scripts": [
     {
       "matches": [
-        "https://www.adidas.co.il/*",
-        "https://www.terminalx.com/*",
-        "https://www.nike.com/il/*",
-        "https://www.zara.com/il/*",
-        "https://www.asos.com/*"
+        "*://*.adidas.co.il/*",
+        "*://*.terminalx.com/*",
+        "*://*.super-pharm.co.il/*"
       ],
-      "js": [ "userTracker.js" ]
-    },
-    {
-      "matches": [ "https://www.adidas.co.il/*" ],
-      "js": [ "content.js" ]
+      "js": [ "config.js", "userTracker.js", "content.js" ]
     }
   ]
 }
