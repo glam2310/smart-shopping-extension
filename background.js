@@ -60,7 +60,7 @@ if (message.type === "CREATE_STOCK_ALERT") {
   
 });
 
-async function checkNotifications() {
+/*async function checkNotifications() {
   const userId = '11111111-1111-1111-1111-111111111111';
 
   try {
@@ -90,4 +90,4 @@ async function checkNotifications() {
 }
 setInterval(checkNotifications, 60 * 1000);
 
-checkNotifications();
+checkNotifications();*/

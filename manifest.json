@@ -19,13 +19,14 @@
     "service_worker": "background.js"
   },
 "content_scripts": [
-    {
-      "matches": [
-        "*://*.adidas.co.il/*",
-        "*://*.terminalx.com/*",
-        "*://*.super-pharm.co.il/*"
-      ],
-      "js": [ "config.js", "userTracker.js", "content.js" ]
-    }
-  ]
+  {
+    "matches": [
+      "*://*.super-pharm.co.il/*",
+      "*://*.365mashbir.co.il/*",
+      "*://*.ksp.co.il/*",
+      "*://*.shufersal.co.il/*"
+    ],
+    "js": ["config.js", "content.js"]
+  }
+]
 }
