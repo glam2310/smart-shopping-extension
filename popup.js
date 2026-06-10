@@ -263,18 +263,22 @@ async function setupActiveTracking(productData, sourceSite, sourceUrl) {
     });
 }
 
-function findBestDealSite(results) {
+function findBestDealSites(results) {
     const current = sanitizePrice(currentSitePrice);
-    if (current == null) return null;
+    if (current == null) return new Set();
 
     const priced = results
         .map(r => ({ ...r, price: sanitizePrice(r.price) }))
         .filter(r => r.price != null);
 
-    if (!priced.length) return null;
+    if (!priced.length) return new Set();
 
-    const cheapest = priced.reduce((min, r) => (r.price < min.price ? r : min), priced[0]);
-    return cheapest.price < current ? cheapest.site : null;
+    const minPrice = Math.min(...priced.map(r => r.price));
+    if (minPrice >= current) return new Set();
+
+    return new Set(
+        priced.filter(r => r.price === minPrice).map(r => r.site)
+    );
 }
 
 function createPriceButton(site, price, productUrl, isBestDeal = false) {
@@ -452,7 +456,7 @@ function launchConfetti() {
 function appendDealButtons(container, results, loadingEl) {
     container.querySelectorAll('.deal-btn').forEach(el => el.remove());
 
-    const bestSite = findBestDealSite(results);
+    const bestSites = findBestDealSites(results);
     const withPrice = results.filter(r => sanitizePrice(r.price) != null);
     const withoutPrice = results.filter(r => sanitizePrice(r.price) == null);
 
@@ -461,7 +465,7 @@ function appendDealButtons(container, results, loadingEl) {
         .forEach(({ site, price, productUrl }) => {
             const displayPrice = formatDisplayPrice(price);
             container.insertBefore(
-                createPriceButton(site, displayPrice, productUrl, site === bestSite),
+                createPriceButton(site, displayPrice, productUrl, bestSites.has(site)),
                 loadingEl?.parentNode === container ? loadingEl : null
             );
         });
