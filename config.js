@@ -51,15 +51,34 @@ const SITES_CONFIG = {
         eanExtraction: {
             strategies: [
                 { type: "script", regex: /"barcode"\s*:\s*"(\d{8,14})"/i },
+                { type: "script", regex: /"sku"\s*:\s*"(\d{8,14})"/i },
                 {
                     type: "page-scan",
-                    patterns: [/"barcode"\s*:\s*"(\d{8,14})"/i]
+                    patterns: [
+                        /"barcode"\s*:\s*"(\d{8,14})"/i,
+                        /"sku"\s*:\s*"(\d{8,14})"/i
+                    ]
                 }
             ]
         },
         scrape: {
             renderDelay: 3500,
             searchPageHints: ["/search", "?q="],
+            productNameVerification: {
+                enabled: true,
+                trustEanMatch: true,
+                minSimilarity: 0.2,
+                minMatchingTokens: 2,
+                productPageSelectors: [
+                    "h1",
+                    ".product-title",
+                    ".product-name",
+                    "meta[property='og:title']"
+                ],
+                searchCardTitleSelectors: [
+                    "h2", "h3", ".product-title", ".card__heading", "[class*='product-title']"
+                ]
+            },
             priceExtraction: [
                 {
                     type: "data-attributes",
@@ -72,7 +91,18 @@ const SITES_CONFIG = {
                 },
                 {
                     type: "dom",
-                    selectors: [".product-price", ".price-wrapper .price", ".final-price", ".price"]
+                    selectors: [
+                        ".price-item--regular .price-item__price",
+                        ".product__info .price",
+                        ".price-wrapper .price",
+                        ".final-price",
+                        ".product-price"
+                    ],
+                    excludeClosest: [
+                        "input", "select", "textarea",
+                        "[name='quantity']", "[id*='Quantity']",
+                        "[class*='quantity']", ".quantity"
+                    ]
                 }
             ],
             navigation: {
@@ -88,8 +118,11 @@ const SITES_CONFIG = {
                 productPageConfirmSelector: "h1, .product-title, .product-name",
                 singleResultFallback: false,
                 tryProductLinks: true,
-                firstResultFallback: true,
-                maxProductAttempts: 12
+                // Mashbir search is fuzzy — never blindly take first of many results
+                firstResultFallback: false,
+                firstResultFallbackOnlyWhenSingle: true,
+                verifyEanOnProductPage: true,
+                maxProductAttempts: 15
             }
         }
     },
@@ -98,6 +131,8 @@ const SITES_CONFIG = {
         name: "KSP",
         displayName: "KSP",
         siteType: "retail",
+        enabled: false, // dev only — set true before prod
+        compareRole: "origin-only",
         requiresEan: true,
         noEanMessage: "מוצר זה לא נתמך בחיפוש באתרים אחרים (אין ברקוד)",
         searchUrlPattern: "https://ksp.co.il/web/cat/?search={{ean}}",
@@ -195,21 +230,35 @@ const SITES_CONFIG = {
     }
 };
 
-function getSiteConfig(hostname) {
+function isSiteEnabled(cfg) {
+    return Boolean(cfg) && cfg.enabled !== false;
+}
+
+function resolveSiteEntry(hostname) {
     if (!hostname) return null;
-    if (SITES_CONFIG[hostname]) return SITES_CONFIG[hostname];
+
+    if (SITES_CONFIG[hostname]) return { key: hostname, cfg: SITES_CONFIG[hostname] };
 
     const withoutWww = hostname.replace(/^www\./, '');
-    if (SITES_CONFIG[withoutWww]) return SITES_CONFIG[withoutWww];
+    if (SITES_CONFIG[withoutWww]) return { key: withoutWww, cfg: SITES_CONFIG[withoutWww] };
 
     const withWww = hostname.startsWith('www.') ? hostname : `www.${hostname}`;
-    return SITES_CONFIG[withWww] || null;
+    if (SITES_CONFIG[withWww]) return { key: withWww, cfg: SITES_CONFIG[withWww] };
+
+    return null;
+}
+
+function getSiteConfig(hostname) {
+    const resolved = resolveSiteEntry(hostname);
+    if (!resolved || !isSiteEnabled(resolved.cfg)) return null;
+    return resolved.cfg;
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { SITES_CONFIG, getSiteConfig };
+    module.exports = { SITES_CONFIG, getSiteConfig, isSiteEnabled, resolveSiteEntry };
 }
 
 if (typeof window !== 'undefined') {
     window.getSiteConfig = getSiteConfig;
+    window.isSiteEnabled = isSiteEnabled;
 }

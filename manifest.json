@@ -22,11 +22,11 @@
   {
     "matches": [
       "*://*.super-pharm.co.il/*",
-      "*://*.365mashbir.co.il/*",
-      "*://*.ksp.co.il/*",
+      "*://*.365mashbir.co.il/*", 
+      "*://.ksp.co.il/*",
       "*://*.shufersal.co.il/*"
     ],
-    "js": ["config.js", "content.js"]
+    "js": ["config.js", "content.js", "userTracker.js"]
   }
 ]
 }

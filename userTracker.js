@@ -1,88 +1,134 @@
-console.log("userTracker loaded");
+// userTracker.js — passive dwell tracking on supported product pages
+
+const PASSIVE_DWELL_TIME_SEC = 30;
 const sessionId = crypto.randomUUID();
-function getOrCreateUserId(callback) {
-  chrome.storage.local.get(["user_id"], (result) => {
-    if (result.user_id) {
-      callback(result.user_id);
-      return;
+let passiveSent = false;
+let startTime = Date.now();
+
+function getOrCreateInstallationId(callback) {
+    chrome.storage.local.get(['installation_id', 'user_id'], (result) => {
+        if (result.installation_id) {
+            callback(result.installation_id);
+            return;
+        }
+
+        if (result.user_id) {
+            chrome.storage.local.set({ installation_id: result.user_id }, () => {
+                callback(result.user_id);
+            });
+            return;
+        }
+
+        const newId = crypto.randomUUID();
+        chrome.storage.local.set({ installation_id: newId }, () => {
+            console.log('[Tracker] New installation:', newId);
+            callback(newId);
+        });
+    });
+}
+
+function sendToBackground(message) {
+    return new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage(message, (response) => {
+            if (chrome.runtime.lastError) {
+                reject(chrome.runtime.lastError.message);
+                return;
+            }
+            if (!response?.ok) {
+                reject(response?.error || response?.data?.reason || 'Request failed');
+                return;
+            }
+            resolve(response.data);
+        });
+    });
+}
+
+function isValidEan(ean) {
+    return /^\d{8,14}$/.test(String(ean || ''));
+}
+
+function extractProductContext() {
+    const hostname = window.location.hostname;
+    const config = typeof getSiteConfig === 'function'
+        ? getSiteConfig(hostname)
+        : (typeof SITES_CONFIG !== 'undefined' && typeof isSiteEnabled === 'function'
+            ? (isSiteEnabled(SITES_CONFIG[hostname]) ? SITES_CONFIG[hostname] : null)
+            : (typeof SITES_CONFIG !== 'undefined' ? SITES_CONFIG[hostname] : null));
+
+    if (!config || config.siteType !== 'retail') return null;
+
+    let ean = null;
+    if (typeof extractEan === 'function') {
+        ean = extractEan(config);
     }
 
-    const newUserId = crypto.randomUUID();
+    if (!isValidEan(ean)) return null;
 
-    chrome.storage.local.set({ user_id: newUserId }, () => {
-      console.log("New user created:", newUserId);
-      callback(newUserId);
+    const productName = (document.title || '').split('|')[0].trim();
+    const brand = config.displayName || config.name || hostname;
+
+    return {
+        ean,
+        source_site: hostname,
+        source_url: window.location.href,
+        product_name: productName,
+        brand
+    };
+}
+
+async function sendPassiveTrack(dwellSeconds) {
+    const context = extractProductContext();
+    if (!context) return;
+
+    getOrCreateInstallationId(async (installationId) => {
+        try {
+            const response = await sendToBackground({
+                type: 'TRACK_PRODUCT',
+                payload: {
+                    installation_id: installationId,
+                    ean: context.ean,
+                    source_site: context.source_site,
+                    tracking_type: 'passive',
+                    dwell_seconds: dwellSeconds,
+                    source_url: context.source_url,
+                    product_name: context.product_name,
+                    brand: context.brand,
+                    session_id: sessionId,
+                    extension_version: chrome.runtime.getManifest().version,
+                    locale: navigator.language,
+                    platform: navigator.platform
+                }
+            });
+
+            console.log('[Tracker] Passive track recorded:', response);
+        } catch (err) {
+            console.warn('[Tracker] Passive track skipped:', err);
+        }
     });
-  });
 }
 
-function sendMessageToBackground(message) {
-  return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(message, (response) => {
-      if (!response || !response.ok) {
-        reject(response?.error || "Background request failed");
-        return;
-      }
-
-      resolve(response.data);
-    });
-  });
+function resetDwellTimer() {
+    startTime = Date.now();
+    passiveSent = false;
 }
 
-function getCurrentProductContext(callback) {
-  chrome.storage.local.get(["current_product_context"], (result) => {
-    callback(result.current_product_context || {});
-  });
-}
-
-async function trackUserEvent(eventType, durationSeconds) {
-  if (durationSeconds < 10) {
-    console.log("Event ignored: duration too short");
-    return;
-  }
-
-  getOrCreateUserId((userId) => {
-    getCurrentProductContext(async (context) => {
-      try {
-        const productData = await sendMessageToBackground({
-          type: "FIND_OR_CREATE_PRODUCT",
-          payload: {
-            brand: context.brand || "unknown",
-            product_name: context.product_name || document.title || "unknown",
-            source_url: context.source_url || window.location.href
-          }
-        });
-
-        const eventResponse = await sendMessageToBackground({
-          type: "TRACK_EVENT",
-payload: {
-  user_id: userId,
-  product_id: productData.product_id,
-  event_type: eventType,
-  duration_seconds: durationSeconds,
-  session_id: sessionId
-}
-        });
-
-        console.log("Tracking response:", eventResponse);
-      } catch (error) {
-        console.error("Tracking failed:", error);
-      }
-    });
-  });
-}
-
-let startTime = Date.now();
-let lastSentDuration = 0;
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+        resetDwellTimer();
+    } else {
+        startTime = Date.now();
+    }
+});
 
 setInterval(() => {
-  const durationSeconds = Math.floor((Date.now() - startTime) / 1000);
+    if (passiveSent || document.visibilityState !== 'visible') return;
 
-  if (durationSeconds >= 10 && durationSeconds !== lastSentDuration) {
-    lastSentDuration = durationSeconds;
+    const dwellSeconds = Math.floor((Date.now() - startTime) / 1000);
+    if (dwellSeconds < PASSIVE_DWELL_TIME_SEC) return;
 
-    console.log("Tracking real duration:", durationSeconds);
+    passiveSent = true;
+    console.log('[Tracker] Passive dwell reached:', dwellSeconds, 's');
+    sendPassiveTrack(dwellSeconds);
+}, 5000);
 
-    trackUserEvent("view", durationSeconds);
-  }
-}, 10000);
+console.log('[Tracker] Passive tracking active (threshold:', PASSIVE_DWELL_TIME_SEC, 's)');

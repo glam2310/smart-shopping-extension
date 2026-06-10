@@ -1,11 +1,17 @@
 const express = require('express');
 const puppeteer = require('puppeteer-core');
+const { Cluster } = require('puppeteer-cluster');
 
 const app = express();
 app.use(express.json());
 
 const PORT = 3001;
 const CHROME_PATH = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+const MAX_CONCURRENCY = Number(process.env.SCRAPER_MAX_CONCURRENCY || 3);
+const CLUSTER_TASK_TIMEOUT_MS = Number(process.env.SCRAPER_TASK_TIMEOUT_MS || 120000);
+
+let clusterInstance = null;
+let clusterInitPromise = null;
 
 const DEFAULT_SCRAPE = {
     renderDelay: 3500,
@@ -55,6 +61,99 @@ function sleep(ms) {
     return new Promise(r => setTimeout(r, ms));
 }
 
+const NAME_STOP_WORDS = new Set([
+    'the', 'and', 'for', 'with', 'from', 'ml', 'spf', 'edp', 'edt', 'eau', 'de', 'parfum',
+    'מ', 'ל', 'של', 'עם', 'את', 'על', 'מל', 'מ"ל', 'גרם', 'יח', 'בושם', 'לאישה', 'לגבר',
+    'מוצר', 'חדש', 'מבצע', 'sale', 'או'
+]);
+
+const BRAND_TOKEN_ALIASES = {
+    ysl: ['yves', 'saint', 'laurent'],
+    ck: ['calvin', 'klein'],
+    jpg: ['jean', 'paul', 'gaultier'],
+    yslb: ['yves', 'saint', 'laurent']
+};
+
+function normalizeProductName(name) {
+    return String(name || '')
+        .toLowerCase()
+        .normalize('NFKC')
+        .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function tokenizeProductName(name) {
+    return normalizeProductName(name)
+        .replace(/(\d+)([a-z\u0590-\u05ff]{1,4})/gi, '$1 $2')
+        .split(' ')
+        .filter(token => token.length >= 2 && !NAME_STOP_WORDS.has(token));
+}
+
+function countAliasMatches(srcTokens, tgtTokens) {
+    let bonus = 0;
+    const tgtSet = new Set(tgtTokens);
+    const srcSet = new Set(srcTokens);
+
+    for (const [alias, expanded] of Object.entries(BRAND_TOKEN_ALIASES)) {
+        const aliasInTgt = tgtSet.has(alias);
+        const aliasInSrc = srcSet.has(alias);
+        if (!aliasInTgt && !aliasInSrc) continue;
+
+        const expandedInSrc = expanded.filter(t => srcSet.has(t)).length;
+        const expandedInTgt = expanded.filter(t => tgtSet.has(t)).length;
+
+        if (aliasInTgt && expandedInSrc >= 2) bonus++;
+        if (aliasInSrc && expandedInTgt >= 2) bonus++;
+    }
+
+    return bonus;
+}
+
+function evaluateNameSimilarity(sourceName, targetName, config = {}) {
+    const minSimilarity = config.minSimilarity ?? 0.25;
+    const minMatchingTokens = config.minMatchingTokens ?? 2;
+
+    if (!sourceName?.trim()) {
+        return { score: 1, matchingTokens: 0, pass: true, skipped: true };
+    }
+    if (!targetName?.trim()) {
+        return { score: 0, matchingTokens: 0, pass: false, skipped: false };
+    }
+
+    const srcTokens = tokenizeProductName(sourceName);
+    const tgtNorm = normalizeProductName(targetName);
+    const tgtTokens = new Set(tokenizeProductName(targetName));
+
+    let matchingTokens = 0;
+    for (const token of srcTokens) {
+        if (tgtTokens.has(token)) {
+            matchingTokens++;
+            continue;
+        }
+        if (token.length < 3) continue;
+
+        let matched = false;
+        for (const tgtToken of tgtTokens) {
+            if (tgtToken.length >= 3 && (token.includes(tgtToken) || tgtToken.includes(token))) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched && tgtNorm.includes(token)) {
+            matched = true;
+        }
+        if (matched) matchingTokens++;
+    }
+
+    matchingTokens += countAliasMatches(srcTokens, [...tgtTokens]);
+
+    const score = srcTokens.length ? matchingTokens / srcTokens.length : 0;
+    const pass = matchingTokens >= minMatchingTokens || score >= minSimilarity;
+
+    return { score, matchingTokens, pass, skipped: false, srcTokenCount: srcTokens.length };
+}
+
 function resolveScrapeConfig(siteSettings) {
     const scrape = siteSettings.scrape || {};
     const navigation = { ...DEFAULT_SCRAPE.navigation, ...(scrape.navigation || {}) };
@@ -95,7 +194,54 @@ function resolveScrapeConfig(siteSettings) {
         maxPrice: scrape.maxPrice ?? DEFAULT_SCRAPE.maxPrice,
         searchPageHints: scrape.searchPageHints || DEFAULT_SCRAPE.searchPageHints,
         priceExtraction,
-        navigation
+        navigation,
+        productNameVerification: {
+            enabled: false,
+            trustEanMatch: false,
+            minSimilarity: 0.25,
+            minMatchingTokens: 2,
+            productPageSelectors: [
+                'h1',
+                '.product-title',
+                '.product-name',
+                'meta[property="og:title"]'
+            ],
+            searchCardTitleSelectors: [
+                'h2', 'h3', '.product-title', '.card__heading', '[class*="product-title"]'
+            ],
+            ...(scrape.productNameVerification || {})
+        }
+    };
+}
+
+async function extractProductNameOnPage(page, selectors) {
+    const sels = selectors?.length
+        ? selectors
+        : ['h1', 'meta[property="og:title"]'];
+
+    return page.evaluate((selList) => {
+        for (const sel of selList) {
+            const el = document.querySelector(sel);
+            if (!el) continue;
+            const text = el.getAttribute?.('content') || el.textContent || '';
+            if (text.trim()) return text.trim();
+        }
+        return (document.title || '').split('|')[0].trim();
+    }, sels);
+}
+
+async function verifyProductNameOnPage(page, sourceProductName, nameConfig) {
+    if (!nameConfig?.enabled || !sourceProductName?.trim()) {
+        return { pass: true, skipped: true };
+    }
+
+    const targetName = await extractProductNameOnPage(page, nameConfig.productPageSelectors);
+    const result = evaluateNameSimilarity(sourceProductName, targetName, nameConfig);
+
+    return {
+        ...result,
+        sourceName: sourceProductName,
+        targetName
     };
 }
 
@@ -173,6 +319,12 @@ async function collectProductLinks(page, scrapeConfig) {
         }
         return links;
     }, nav);
+}
+
+function shouldUseFirstResultFallback(nav, resultCount) {
+    if (!nav.firstResultFallback || resultCount <= 0) return false;
+    if (nav.firstResultFallbackOnlyWhenSingle && resultCount > 1) return false;
+    return true;
 }
 
 function serializeEanStrategies(eanExtraction) {
@@ -282,15 +434,112 @@ async function extractEanOnPage(page, eanExtraction) {
     }, strategies);
 }
 
-async function tryProductLinksByEan(page, ean, scrapeConfig, siteSettings, siteLabel, preCollectedLinks) {
+async function verifyEanOnPage(page, ean) {
+    const found = await page.evaluate((targetEan) => {
+        const html = document.documentElement.innerHTML;
+        const exact = new RegExp(`"(?:barcode|sku)"\\s*:\\s*"${targetEan}"`, 'i');
+        return exact.test(html);
+    }, ean);
+    return found;
+}
+
+async function prioritizeLinksBySearchMatch(page, links, ean, sourceProductName, nameConfig) {
+    if (!links.length) return links;
+
+    const sourceTokens = nameConfig?.enabled
+        ? tokenizeProductName(sourceProductName)
+        : [];
+
+    return page.evaluate((linkList, targetEan, tokens, cardSelectors, minMatchingTokens) => {
+        const barcodeRe = new RegExp(`"barcode"\\s*:\\s*"${targetEan}"`, 'i');
+        const skuRe = new RegExp(`"sku"\\s*:\\s*"${targetEan}"`, 'i');
+        const barcodeMatched = [];
+        const nameMatched = [];
+        const rest = [];
+        const seen = new Set();
+
+        function cardMatches(html) {
+            return barcodeRe.test(html) || skuRe.test(html);
+        }
+
+        function normalize(text) {
+            return String(text || '').toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+        }
+
+        function countNameMatches(title) {
+            if (!tokens?.length) return 0;
+            const norm = normalize(title);
+            const titleTokens = new Set(norm.split(' ').filter(Boolean));
+            let hits = 0;
+            for (const token of tokens) {
+                if (titleTokens.has(token) || (token.length >= 4 && norm.includes(token))) hits++;
+            }
+            return hits;
+        }
+
+        function cardTitle(card) {
+            if (!card) return '';
+            for (const sel of cardSelectors || []) {
+                const el = card.querySelector(sel);
+                if (el?.textContent?.trim()) return el.textContent.trim();
+            }
+            return card.textContent?.trim() || '';
+        }
+
+        for (const url of linkList) {
+            let barcodeHit = false;
+            let nameHits = 0;
+
+            for (const el of document.querySelectorAll('a[href], button[class*="quickview"]')) {
+                const href = el.href || '';
+                const outer = el.outerHTML || '';
+                const inScope = href === url
+                    || outer.includes(url.replace(location.origin, ''))
+                    || (url.includes('/products/') && outer.includes(url.split('/products/')[1]?.split('?')[0] || ''));
+
+                if (!inScope) continue;
+
+                const card = el.closest('[class*="product"]')
+                    || el.closest('li')
+                    || el.closest('article')
+                    || el.parentElement;
+                const html = (card?.innerHTML || '') + outer;
+                if (cardMatches(html)) barcodeHit = true;
+                nameHits = Math.max(nameHits, countNameMatches(cardTitle(card)));
+            }
+
+            if (seen.has(url)) continue;
+
+            if (barcodeHit) {
+                barcodeMatched.push(url);
+                seen.add(url);
+            } else if (nameHits >= (minMatchingTokens || 2)) {
+                nameMatched.push(url);
+                seen.add(url);
+            }
+        }
+
+        for (const url of linkList) {
+            if (!seen.has(url)) rest.push(url);
+        }
+
+        return [...barcodeMatched, ...nameMatched, ...rest];
+    }, links, ean, sourceTokens, nameConfig?.searchCardTitleSelectors || [], nameConfig?.minMatchingTokens ?? 2);
+}
+
+async function tryProductLinksByEan(page, ean, scrapeConfig, siteSettings, siteLabel, preCollectedLinks, sourceProductName) {
     const nav = scrapeConfig.navigation || {};
-    const links = preCollectedLinks || await collectProductLinks(page, scrapeConfig);
+    const rawLinks = preCollectedLinks || await collectProductLinks(page, scrapeConfig);
+    const links = await prioritizeLinksBySearchMatch(
+        page, rawLinks, ean, sourceProductName, scrapeConfig.productNameVerification
+    );
     const maxAttempts = nav.maxProductAttempts || 8;
 
     log('INFO', 'Trying product links by EAN verification', {
         siteLabel,
         ean,
         linkCount: links.length,
+        prioritizedMatches: links.length !== rawLinks.length,
         maxAttempts
     });
 
@@ -300,7 +549,27 @@ async function tryProductLinksByEan(page, ean, scrapeConfig, siteSettings, siteL
             await sleep(scrapeConfig.renderDelay);
 
             const pageEan = await extractEanOnPage(page, siteSettings.eanExtraction);
-            if (pageEan !== ean) continue;
+            const htmlMatch = pageEan === ean || await verifyEanOnPage(page, ean);
+            if (!htmlMatch) continue;
+
+            const nameConfig = scrapeConfig.productNameVerification;
+            if (nameConfig.enabled && !nameConfig.trustEanMatch) {
+                const nameCheck = await verifyProductNameOnPage(
+                    page, sourceProductName, nameConfig
+                );
+                if (!nameCheck.pass) {
+                    log('WARN', 'Product link rejected: name mismatch', {
+                        siteLabel,
+                        ean,
+                        productUrl: link,
+                        score: nameCheck.score,
+                        matchingTokens: nameCheck.matchingTokens,
+                        sourceName: nameCheck.sourceName,
+                        targetName: nameCheck.targetName
+                    });
+                    continue;
+                }
+            }
 
             log('INFO', 'EAN verified on product page', { siteLabel, ean, productUrl: link });
             return extractFromPage(page, ean, scrapeConfig);
@@ -323,18 +592,47 @@ async function extractFromPage(page, ean, scrapeConfig) {
             return !decimals || decimals.length <= 2;
         }
 
+        function normalizeRawPrice(raw) {
+            if (raw == null || raw === '') return null;
+            const str = String(raw).trim().replace(/,/g, '');
+            const val = parseFloat(str);
+            if (!Number.isFinite(val) || val <= 0) return null;
+
+            if (val > MAX_PRICE && val % 100 === 0) {
+                const scaled = val / 100;
+                if (isValidPrice(scaled)) return scaled;
+            }
+
+            return isValidPrice(val) ? val : null;
+        }
+
         function parsePriceText(text) {
             if (!text || !/\d/.test(text)) return null;
 
-            const shekel = text.match(/₪\s*([\d,]+(?:\.\d{1,2})?)/);
-            if (shekel) {
-                const val = parseFloat(shekel[1].replace(/,/g, ''));
+            const normalized = text.replace(/\s+/g, ' ').trim();
+
+            const shekelPatterns = [
+                /₪\s*([\d,]+(?:\.\d{1,2})?)/,
+                /([\d,]+(?:\.\d{1,2})?)\s*₪/
+            ];
+            for (const pattern of shekelPatterns) {
+                const match = normalized.match(pattern);
+                if (match) {
+                    const val = parseFloat(match[1].replace(/,/g, ''));
+                    if (isValidPrice(val)) return val;
+                }
+            }
+
+            const commaThousands = normalized.match(/(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?)/);
+            if (commaThousands) {
+                const val = parseFloat(commaThousands[1].replace(/,/g, ''));
                 if (isValidPrice(val)) return val;
             }
 
-            const number = text.match(/(\d{1,4}(?:\.\d{1,2})?)/);
-            if (number) {
-                const val = parseFloat(number[1]);
+            const plain = normalized.match(/(\d+(?:\.\d{1,2})?)/);
+            if (plain) {
+                const val = parseFloat(plain[1].replace(/,/g, ''));
+                if (normalized.includes(',') && val < 10) return null;
                 if (isValidPrice(val)) return val;
             }
 
@@ -360,14 +658,14 @@ async function extractFromPage(page, ean, scrapeConfig) {
                         const list = Array.isArray(offers) ? offers : offers ? [offers] : [];
 
                         for (const offer of list) {
-                            const val = parseFloat(offer?.[field]);
-                            if (isValidPrice(val)) {
+                            const val = normalizeRawPrice(offer?.[field]);
+                            if (val) {
                                 return { price: val, text: String(val), selector: `json-ld ${path}` };
                             }
                         }
                     } else {
-                        const val = parseFloat(path.split('.').reduce((o, k) => o?.[k], obj));
-                        if (isValidPrice(val)) {
+                        const val = normalizeRawPrice(path.split('.').reduce((o, k) => o?.[k], obj));
+                        if (val) {
                             return { price: val, text: String(val), selector: `json-ld ${path}` };
                         }
                     }
@@ -396,8 +694,8 @@ async function extractFromPage(page, ean, scrapeConfig) {
                     } catch (_2) {
                         const offerMatch = raw.match(/"offers"\s*:\s*\{[^}]*"price"\s*:\s*"?([\d.]+)"?/s);
                         if (offerMatch) {
-                            const val = parseFloat(offerMatch[1]);
-                            if (isValidPrice(val)) {
+                            const val = normalizeRawPrice(offerMatch[1]);
+                            if (val) {
                                 return {
                                     price: val,
                                     text: offerMatch[1],
@@ -425,8 +723,8 @@ async function extractFromPage(page, ean, scrapeConfig) {
 
             for (const attr of strategy.attributes || []) {
                 const raw = root.getAttribute(attr);
-                const val = parseFloat(raw);
-                if (isValidPrice(val)) {
+                const val = normalizeRawPrice(raw);
+                if (val) {
                     return {
                         price: val,
                         text: raw,
@@ -453,21 +751,42 @@ async function extractFromPage(page, ean, scrapeConfig) {
         }
 
         function extractDom(strategy) {
-            const excludeClosest = strategy.excludeClosest || [];
+            const excludeClosest = strategy.excludeClosest || [
+                'input', 'select', 'textarea', '[name="quantity"]', '[class*="quantity"]'
+            ];
+            const skipTags = new Set(['INPUT', 'SELECT', 'TEXTAREA', 'OPTION']);
+            const candidates = [];
 
             for (const sel of strategy.selectors || []) {
                 for (const el of document.querySelectorAll(sel)) {
+                    if (skipTags.has(el.tagName)) continue;
                     if (isExcludedElement(el, excludeClosest)) continue;
 
-                    const text = (el.innerText || '').trim();
+                    const text = (el.innerText || el.textContent || '').trim();
                     const price = parsePriceText(text);
                     if (price) {
-                        return { price, text, selector: sel };
+                        candidates.push({
+                            price,
+                            text,
+                            selector: sel,
+                            hasShekel: text.includes('₪'),
+                            hasComma: /,\d{3}/.test(text)
+                        });
                     }
                 }
             }
 
-            return null;
+            if (!candidates.length) return null;
+
+            candidates.sort((a, b) => {
+                const score = (c) =>
+                    (c.hasShekel ? 4 : 0) + (c.hasComma ? 2 : 0) + (c.price >= 10 ? 1 : 0);
+                const diff = score(b) - score(a);
+                return diff !== 0 ? diff : b.price - a.price;
+            });
+
+            const best = candidates[0];
+            return { price: best.price, text: best.text, selector: best.selector };
         }
 
         function extractPrice() {
@@ -605,16 +924,45 @@ async function extractFromPage(page, ean, scrapeConfig) {
             return links;
         }
 
-        function findProductLinkByBarcodeInCard() {
-            const selector = (nav.productLinkSelectors || []).join(', ') || "a[href*='/products/']";
+        function cardHasEan(html) {
             const barcodeRe = new RegExp(`"barcode"\\s*:\\s*"${ean}"`, 'i');
+            const skuRe = new RegExp(`"sku"\\s*:\\s*"${ean}"`, 'i');
+            return barcodeRe.test(html) || skuRe.test(html);
+        }
 
+        function findProductLinkByBarcodeInCard() {
+            const attrRegex = nav.linkAttributeRegex
+                ? new RegExp(nav.linkAttributeRegex)
+                : null;
+
+            for (const sel of nav.linkAttributeSelectors || []) {
+                for (const el of document.querySelectorAll(sel)) {
+                    const card = el.closest('[class*="product"]')
+                        || el.closest('li')
+                        || el.closest('article')
+                        || el.parentElement;
+                    const html = (card?.innerHTML || '') + (el.outerHTML || '');
+                    if (!cardHasEan(html)) continue;
+
+                    if (attrRegex) {
+                        const match = (el.outerHTML || '').match(attrRegex);
+                        if (match) {
+                            const url = toAbsoluteUrl(match[0]);
+                            if (!isExcludedProductLink(url)) {
+                                return { url, reason: 'barcode-in-card' };
+                            }
+                        }
+                    }
+                }
+            }
+
+            const selector = (nav.productLinkSelectors || []).join(', ') || "a[href*='/products/']";
             for (const link of document.querySelectorAll(selector)) {
                 const card = link.closest('[class*="product"]')
                     || link.closest('li')
                     || link.closest('article')
                     || link.parentElement;
-                if (!card || !barcodeRe.test(card.innerHTML || '')) continue;
+                if (!card || !cardHasEan(card.innerHTML || '')) continue;
 
                 const href = link.href || '';
                 if (!isExcludedProductLink(href)) {
@@ -683,59 +1031,74 @@ async function extractFromPage(page, ean, scrapeConfig) {
     }, ean, scrapeConfig);
 }
 
-async function executeScrape(targetSite, ean, siteSettings) {
-    let browser;
-    const scrapeConfig = resolveScrapeConfig(siteSettings);
-    const siteLabel = siteSettings.displayName || siteSettings.name || targetSite;
+async function preparePage(page, scrapeConfig) {
+    await page.setUserAgent(
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    );
+    if (scrapeConfig.extraHeaders && Object.keys(scrapeConfig.extraHeaders).length) {
+        await page.setExtraHTTPHeaders(scrapeConfig.extraHeaders);
+    }
+
+    await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'languages', { get: () => ['he-IL', 'he', 'en-US', 'en'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        window.chrome = window.chrome || { runtime: {} };
+    });
+
+    const blockResources = scrapeConfig.blockResources || [];
+    if (blockResources.length) {
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            if (blockResources.includes(req.resourceType())) req.abort();
+            else req.continue();
+        });
+    }
+}
+
+async function initCluster() {
+    if (clusterInstance) return clusterInstance;
+    if (clusterInitPromise) return clusterInitPromise;
+
+    clusterInitPromise = (async () => {
+        const cluster = await Cluster.launch({
+            concurrency: Cluster.CONCURRENCY_PAGE,
+            maxConcurrency: MAX_CONCURRENCY,
+            puppeteer,
+            puppeteerOptions: {
+                executablePath: CHROME_PATH,
+                headless: DEFAULT_SCRAPE.headless,
+                args: DEFAULT_SCRAPE.launchArgs
+            },
+            timeout: CLUSTER_TASK_TIMEOUT_MS,
+            retryLimit: 0,
+            monitor: process.env.SCRAPER_CLUSTER_MONITOR === '1'
+        });
+
+        await cluster.task(async ({ page, data }) => {
+            const { targetSite, ean, siteSettings, sourceProductName } = data;
+            const scrapeConfig = resolveScrapeConfig(siteSettings);
+            await preparePage(page, scrapeConfig);
+            return scrapeWithPage(page, targetSite, ean, siteSettings, sourceProductName, scrapeConfig);
+        });
+
+        clusterInstance = cluster;
+        log('INFO', 'Puppeteer cluster ready', { maxConcurrency: MAX_CONCURRENCY });
+        return cluster;
+    })();
 
     try {
-        log('INFO', 'Start scrape', {
-            site: targetSite,
-            siteLabel,
-            ean,
-            strategies: scrapeConfig.priceExtraction.map(s => s.type)
-        });
+        return await clusterInitPromise;
+    } catch (err) {
+        clusterInitPromise = null;
+        throw err;
+    }
+}
 
-        const launchOptions = {
-            executablePath: CHROME_PATH,
-            headless: scrapeConfig.headless,
-            args: scrapeConfig.launchArgs
-        };
-        if (scrapeConfig.ignoreDefaultArgs) {
-            launchOptions.ignoreDefaultArgs = scrapeConfig.ignoreDefaultArgs;
-        }
-        if (scrapeConfig.userDataDir) {
-            launchOptions.userDataDir = scrapeConfig.userDataDir;
-        }
-        browser = await puppeteer.launch(launchOptions);
+async function scrapeWithPage(page, targetSite, ean, siteSettings, sourceProductName, scrapeConfig) {
+    const siteLabel = siteSettings.displayName || siteSettings.name || targetSite;
 
-        const page = await browser.newPage();
-        await page.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        );
-        if (scrapeConfig.extraHeaders && Object.keys(scrapeConfig.extraHeaders).length) {
-            await page.setExtraHTTPHeaders(scrapeConfig.extraHeaders);
-        }
-
-        // Lightweight stealth: hide common headless/automation fingerprints that
-        // anti-bot services (e.g. Cloudflare/PerimeterX) use to return HTTP 403.
-        await page.evaluateOnNewDocument(() => {
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'languages', { get: () => ['he-IL', 'he', 'en-US', 'en'] });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            window.chrome = window.chrome || { runtime: {} };
-        });
-
-        const blockResources = scrapeConfig.blockResources || [];
-        if (blockResources.length) {
-            await page.setRequestInterception(true);
-            page.on('request', (req) => {
-                if (blockResources.includes(req.resourceType())) req.abort();
-                else req.continue();
-            });
-        }
-
-        const searchUrl = siteSettings.searchUrlPattern.replace('{{ean}}', encodeURIComponent(ean));
+    const searchUrl = siteSettings.searchUrlPattern.replace('{{ean}}', encodeURIComponent(ean));
         log('INFO', 'Navigate search URL', { searchUrl });
 
         const searchResponse = await page.goto(searchUrl, {
@@ -795,12 +1158,12 @@ async function executeScrape(targetSite, ean, siteSettings) {
                 const searchLinks = await collectProductLinks(page, scrapeConfig);
 
                 const verified = await tryProductLinksByEan(
-                    page, ean, scrapeConfig, siteSettings, siteLabel, searchLinks
+                    page, ean, scrapeConfig, siteSettings, siteLabel, searchLinks, sourceProductName
                 );
 
                 if (verified) {
                     state = verified;
-                } else if (scrapeConfig.navigation.firstResultFallback && searchLinks.length > 0) {
+                } else if (shouldUseFirstResultFallback(scrapeConfig.navigation, searchLinks.length)) {
                     const firstResult = searchLinks[0];
                     log('INFO', 'First-result fallback: following first product link', {
                         siteLabel,
@@ -811,6 +1174,28 @@ async function executeScrape(targetSite, ean, siteSettings) {
                     await page.goto(firstResult, { waitUntil: 'domcontentloaded', timeout: 45000 });
                     await sleep(scrapeConfig.renderDelay);
                     state = await extractFromPage(page, ean, scrapeConfig);
+
+                    const confirmedEan = await verifyEanOnPage(page, ean);
+                    const confirmedName = await verifyProductNameOnPage(
+                        page, sourceProductName, scrapeConfig.productNameVerification
+                    );
+                    if (!confirmedEan || !confirmedName.pass) {
+                        log('WARN', 'First-result rejected: verification failed', {
+                            siteLabel,
+                            ean,
+                            productUrl: firstResult,
+                            eanOk: confirmedEan,
+                            nameOk: confirmedName.pass,
+                            nameScore: confirmedName.score
+                        });
+                        state = {
+                            ...state,
+                            onSearch: true,
+                            onProduct: false,
+                            price: null,
+                            productUrl: null
+                        };
+                    }
                 } else {
                     log('WARN', 'No product match on search page', {
                         site: targetSite,
@@ -857,7 +1242,39 @@ async function executeScrape(targetSite, ean, siteSettings) {
         const stillOnSearch = (scrapeConfig.searchPageHints || []).some(h =>
             productUrl.toLowerCase().includes(h.toLowerCase())
         );
-        const onProductPage = state.onProduct && !stillOnSearch;
+        let onProductPage = state.onProduct && !stillOnSearch;
+
+        if (onProductPage && scrapeConfig.navigation.verifyEanOnProductPage) {
+            const confirmed = await verifyEanOnPage(page, ean);
+            if (!confirmed) {
+                log('WARN', 'Product page rejected: EAN/barcode not found in page HTML', {
+                    siteLabel,
+                    ean,
+                    productUrl
+                });
+                onProductPage = false;
+            }
+        }
+
+        if (onProductPage && scrapeConfig.productNameVerification?.enabled
+            && !scrapeConfig.productNameVerification.trustEanMatch) {
+            const nameCheck = await verifyProductNameOnPage(
+                page, sourceProductName, scrapeConfig.productNameVerification
+            );
+            if (!nameCheck.pass) {
+                log('WARN', 'Product page rejected: name similarity too low', {
+                    siteLabel,
+                    ean,
+                    productUrl,
+                    score: nameCheck.score,
+                    matchingTokens: nameCheck.matchingTokens,
+                    sourceName: nameCheck.sourceName,
+                    targetName: nameCheck.targetName
+                });
+                onProductPage = false;
+            }
+        }
+
         const hasPrice = onProductPage && state.price > 0;
 
         log(hasPrice ? 'INFO' : 'WARN', 'Scrape complete', {
@@ -873,24 +1290,147 @@ async function executeScrape(targetSite, ean, siteSettings) {
             matchedText: state.text
         });
 
-        await browser.close();
+    return {
+        exists: onProductPage,
+        price: hasPrice ? state.price : null,
+        productUrl: onProductPage ? productUrl : null,
+        error: null
+    };
+}
 
-        return {
-            exists: onProductPage,
-            price: hasPrice ? state.price : null,
-            productUrl: onProductPage ? productUrl : null
-        };
+async function executeScrape(targetSite, ean, siteSettings, sourceProductName = null) {
+    const scrapeConfig = resolveScrapeConfig(siteSettings);
+    const siteLabel = siteSettings.displayName || siteSettings.name || targetSite;
+
+    log('INFO', 'Start scrape', {
+        site: targetSite,
+        siteLabel,
+        ean,
+        sourceProductName: sourceProductName || null,
+        nameVerification: scrapeConfig.productNameVerification?.enabled || false,
+        strategies: scrapeConfig.priceExtraction.map(s => s.type)
+    });
+
+    try {
+        const cluster = await initCluster();
+        return await cluster.execute({
+            targetSite,
+            ean,
+            siteSettings,
+            sourceProductName
+        });
     } catch (err) {
-        log('ERROR', `Scrape failed | ${err.message}`, { site: targetSite, siteLabel, ean });
-        if (browser) await browser.close();
-        return { exists: false, price: null, productUrl: null };
+        log('ERROR', 'Scrape failed', {
+            site: targetSite,
+            siteLabel,
+            ean,
+            error: err.message,
+            code: err.code || 'SCRAPE_ERROR'
+        });
+        return {
+            exists: false,
+            price: null,
+            productUrl: null,
+            error: err.message || 'Scrape failed',
+            code: err.code || 'SCRAPE_ERROR'
+        };
     }
 }
 
+app.get('/health', (_req, res) => {
+    res.json({
+        ok: true,
+        service: 'scraper',
+        port: PORT,
+        chromePath: CHROME_PATH,
+        cluster: {
+            ready: Boolean(clusterInstance),
+            maxConcurrency: MAX_CONCURRENCY
+        }
+    });
+});
+
+async function shutdownCluster() {
+    if (!clusterInstance) return;
+    try {
+        await clusterInstance.idle();
+        await clusterInstance.close();
+        log('INFO', 'Puppeteer cluster closed');
+    } catch (err) {
+        log('ERROR', 'Cluster shutdown failed', { error: err.message });
+    } finally {
+        clusterInstance = null;
+        clusterInitPromise = null;
+    }
+}
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.on(signal, async () => {
+        await shutdownCluster();
+        process.exit(0);
+    });
+}
+
 app.post('/scrape', async (req, res) => {
-    const { targetSite, searchQuery, siteSettings } = req.body;
-    const result = await executeScrape(targetSite, searchQuery, siteSettings);
-    res.json(result);
+    const { targetSite, searchQuery, siteSettings, sourceProductName } = req.body;
+
+    if (!targetSite || !searchQuery) {
+        return res.status(400).json({
+            exists: false,
+            error: 'targetSite and searchQuery are required',
+            code: 'BAD_REQUEST'
+        });
+    }
+
+    if (!siteSettings?.searchUrlPattern) {
+        return res.status(400).json({
+            exists: false,
+            error: 'siteSettings.searchUrlPattern is required',
+            code: 'BAD_REQUEST'
+        });
+    }
+
+    try {
+        const result = await executeScrape(targetSite, searchQuery, siteSettings, sourceProductName);
+        res.json(result);
+    } catch (err) {
+        log('ERROR', 'Unhandled scrape route error', {
+            targetSite,
+            searchQuery,
+            error: err.message,
+            code: err.code
+        });
+        res.status(500).json({
+            exists: false,
+            price: null,
+            productUrl: null,
+            error: err.message || 'Internal scraper error',
+            code: err.code || 'INTERNAL_ERROR'
+        });
+    }
+});
+
+app.use((err, _req, res, _next) => {
+    log('ERROR', 'Express error handler', { error: err.message, code: err.code });
+    res.status(500).json({
+        exists: false,
+        error: err.message || 'Internal server error',
+        code: err.code || 'INTERNAL_ERROR'
+    });
+});
+
+process.on('unhandledRejection', (reason) => {
+    log('ERROR', 'Unhandled promise rejection', {
+        error: reason?.message || String(reason),
+        code: reason?.code
+    });
+});
+
+process.on('uncaughtException', (err) => {
+    log('ERROR', 'Uncaught exception — scraper may be unstable', {
+        error: err.message,
+        code: err.code
+    });
 });
 
 app.listen(PORT, () => {

@@ -3,57 +3,63 @@
 
 <head>
     <meta charset="UTF-8">
-    <title>Smart Shopping Extension</title>
-    <link rel="stylesheet" href="styles.css">
+    <title>Smart Shopping</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Assistant:wght@400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="popup.css">
 </head>
 
 <body>
+    <canvas id="confettiCanvas" aria-hidden="true"></canvas>
 
-    <div class="main-header">Smart Shopping Extension</div>
+    <button id="closePopupBtn" type="button" class="close-btn" aria-label="סגור חלון">&#10005;</button>
 
-    <div class="card">
-        <div class="section-title">Price Comparison</div>
+    <header class="app-header">
+        <div class="app-header__glow" aria-hidden="true"></div>
+        <h1 class="app-header__title">Smart Shopping</h1>
+        <p class="app-header__subtitle">השוואת מחירים חכמה בזמן אמת</p>
+    </header>
 
-        <div class="product-info">
-            <div class="info-item">
-                <span class="info-label">Product:</span>
-                <span id="productName" class="info-value">Loading...</span>
+    <section class="product-hero">
+        <div class="product-hero__media">
+            <img id="productImage" class="product-hero__image" alt="" hidden>
+            <div id="productImageFallback" class="product-hero__image-fallback" aria-hidden="true"></div>
+        </div>
+
+        <div class="product-hero__content">
+            <span class="product-hero__label">Product:</span>
+            <p id="productName" class="product-hero__name">Loading...</p>
+
+            <div class="product-hero__ean">
+                <span class="product-hero__ean-label">EAN:</span>
+                <span id="eanValue" class="product-hero__ean-value">-</span>
             </div>
-            <div class="info-item">
-                <span class="info-label">Brand:</span>
-                <span id="brandName" class="info-value">Scanning...</span>
+        </div>
+    </section>
+
+    <main class="app-main">
+        <section class="card card--compare">
+            <h2 class="card__title card__title--inline">השוואת מחירים</h2>
+
+            <div id="dynamicButtonsContainer" class="deals-list">
+                <div class="loading-state">
+                    <span class="loading-state__dot" aria-hidden="true"></span>
+                    <span class="loading-state__text">בודק זמינות באתרים אחרים...</span>
+                </div>
             </div>
-            <div class="info-item">
-                <span class="info-label">SKU:</span>
-                <span id="skuValue" class="info-value">-</span>
+        </section>
+
+        <section class="card card--alerts">
+            <h2 class="card__title">התראות מחיר</h2>
+            <p class="card__description">קבלו עדכון כשהמחיר יורד באתרים שאתם עוקבים אחריהם</p>
+
+            <div class="track-action">
+                <button id="createAlertBtn" type="button" class="btn-track">Create Product Alert</button>
+                <div id="alertStatus" class="track-status" role="status"></div>
             </div>
-        </div>
-
-        <div id="dynamicButtonsContainer" class="btn-container">
-            <div class="loading-text">Checking availability across sites...</div>
-        </div>
-
-        <div class="btn-container">
-            <button id="createAlertBtn" class="btn-outline">Create Product Alert</button>
-        </div>
-
-        <div id="resultsList"></div>
-        <div id="alertStatus"></div>
-    </div>
-
-    <div class="card">
-        <div class="section-title">Recommended for You</div>
-        <div id="recommendations">
-            <p class="empty-msg">No recommendations yet...</p>
-        </div>
-    </div>
-
-    <div class="debug-footer">
-        <div>Host: <span id="debugHostname">-</span></div>
-        <div>Brand: <span id="debugBrand">-</span></div>
-        <div>Product: <span id="debugProduct">-</span></div>
-        <div>SKU: <span id="debugSku">-</span></div>
-    </div>
+        </section>
+    </main>
 
     <script src="config.js"></script>
     <script src="popup.js"></script>
